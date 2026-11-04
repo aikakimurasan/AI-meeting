@@ -1,0 +1,93 @@
+name: AI対話
+
+# タイトルが「[AI対話]」で始まるIssueを作ると、本文をお題に2つのAIが交互にコメントで会話します
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  models: read
+  contents: read
+
+jobs:
+  talk:
+    if: startsWith(github.event.issue.title, '[AI対話]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            // ===== ここを書き換えて遊べます =====
+            const TURNS = 6; // 発言の合計回数（6なら3往復）
+            const SPEAKERS = [
+              {
+                name: '🟦 GPT（OpenAI）',
+                model: 'openai/gpt-4.1-mini',
+                persona: 'あなたは前向きで好奇心旺盛。アイデアを広げ、具体例を出すのが得意です。',
+              },
+              {
+                name: '🟧 Llama（Meta）',
+                model: 'meta/Llama-3.3-70B-Instruct',
+                persona: 'あなたは慎重で現実的。相手の案の弱点やリスクを指摘し、より良い形を提案します。',
+              },
+            ];
+            const COMMON =
+              'あなたは別の会社が作ったAIと、日本語で対話しています。' +
+              '1回の発言は200字以内。相手の発言に具体的に応じ、同じ内容を繰り返さないでください。';
+            // ====================================
+
+            const topic = (context.payload.issue.body || '').trim() || '自由に雑談してください';
+            const issue_number = context.payload.issue.number;
+            const log = []; // { speaker: 0 or 1, text }
+
+            const comment = (body) =>
+              github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+
+            async function ask(i) {
+              const me = SPEAKERS[i];
+              const messages = [
+                { role: 'system', content: `${COMMON}\n${me.persona}\nお題：${topic}` },
+              ];
+              // 先攻のAIには「話し始めて」という最初の一言を渡す
+              if (i === 0) {
+                messages.push({ role: 'user', content: 'お題について、あなたから話を始めてください。' });
+              }
+              // 自分の発言は assistant、相手の発言は user として渡す
+              for (const m of log) {
+                messages.push({ role: m.speaker === i ? 'assistant' : 'user', content: m.text });
+              }
+              const res = await fetch('https://models.github.ai/inference/chat/completions', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ model: me.model, messages, max_tokens: 500 }),
+              });
+              if (!res.ok) {
+                throw new Error(`${me.name}（${me.model}）の呼び出しに失敗：${res.status} ${await res.text()}`);
+              }
+              const data = await res.json();
+              return data.choices[0].message.content.trim();
+            }
+
+            try {
+              for (let t = 0; t < TURNS; t++) {
+                const i = t % 2;
+                const text = await ask(i);
+                log.push({ speaker: i, text });
+                await comment(`**${SPEAKERS[i].name}**\n\n${text}`);
+                await new Promise((r) => setTimeout(r, 5000)); // 無料枠の回数制限よけ
+              }
+            } catch (e) {
+              await comment(`⚠️ 途中で止まりました\n\n${e.message}`);
+              core.setFailed(e.message);
+            }
