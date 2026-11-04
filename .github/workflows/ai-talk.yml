@@ -1,0 +1,133 @@
+name: AI対話
+
+# タイトルが「[AI対話]」で始まるIssueを作ると、本文をお題に複数のAIがコメントで話し合います
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+  models: read
+  contents: read
+
+jobs:
+  talk:
+    if: startsWith(github.event.issue.title, '[AI対話]')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            // ===== ここを書き換えて遊べます =====
+            const MAX_TURNS = 24; // 発言回数の上限（まとまらなくてもここで打ち切り）
+            const SPEAKERS = [   // 参加者。行を増やせば4人以上も可
+              {
+                name: '🟦 GPT（OpenAI）',
+                model: 'openai/gpt-4.1-mini',
+                persona: 'あなたは前向きで好奇心旺盛。アイデアを広げ、具体例を出すのが得意です。',
+              },
+              {
+                name: '🟧 Llama（Meta）',
+                model: 'meta/Llama-3.3-70B-Instruct',
+                persona: 'あなたは慎重で現実的。案の弱点やリスクを指摘し、より良い形を提案します。',
+              },
+              {
+                name: '🟪 Mistral（Mistral AI）',
+                model: 'mistral-ai/mistral-small-2503',
+                persona: 'あなたは調整役。両者の意見の共通点を見つけ、落としどころを探ります。',
+              },
+            ];
+            const SUMMARY_MODEL = 'openai/gpt-4.1-mini'; // 最後のまとめを書くモデル
+            const COMMON =
+              'You are discussing a topic with several AIs made by different companies. ' +
+              'The topic may be written in Japanese; read it, but always speak in English. ' +
+              'Your goal is to reach a single shared conclusion. ' +
+              'Keep each message under 80 words, and write only the message body without your name. ' +
+              'Respond specifically to the previous messages and do not repeat yourself. ' +
+              'Do not agree too easily; raise objections if you have any. ' +
+              'Only when you truly believe everyone agrees, end your message with 【合意】.';
+            // ====================================
+
+            const topic = (context.payload.issue.body || '').trim() || '自由に話し合ってください';
+            const issue_number = context.payload.issue.number;
+            const N = SPEAKERS.length;
+            const log = []; // { speaker, text }
+
+            const comment = (body) =>
+              github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body,
+              });
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            async function call(model, messages) {
+              const res = await fetch('https://models.github.ai/inference/chat/completions', {
+                method: 'POST',
+                headers: {
+                  Authorization: `Bearer ${process.env.GITHUB_TOKEN}`,
+                  'Content-Type': 'application/json',
+                },
+                body: JSON.stringify({ model, messages, max_tokens: 600 }),
+              });
+              if (!res.ok) throw new Error(`${model} の呼び出しに失敗：${res.status} ${await res.text()}`);
+              const data = await res.json();
+              return data.choices[0].message.content.trim();
+            }
+
+            async function ask(i, nearEnd) {
+              const me = SPEAKERS[i];
+              const others = SPEAKERS.filter((_, k) => k !== i).map((s) => s.name).join('、');
+              let system = `${COMMON}\nあなたの名前：${me.name}\n他の参加者：${others}\n${me.persona}\nお題：${topic}`;
+              if (nearEnd) system += '\n残りの発言回数が少ないので、結論をまとめる方向で話してください。';
+
+              const msgs = [{ role: 'system', content: system }];
+              // 同じ役割が続くときは1つにまとめる（自分＝assistant、他の全員＝user）
+              const push = (role, content) => {
+                const last = msgs[msgs.length - 1];
+                if (last.role === role) last.content += '\n\n' + content;
+                else msgs.push({ role, content });
+              };
+              push('user', log.length === 0 ? '話し合いを始めます。あなたから口火を切ってください。' : '話し合いの記録です。');
+              for (const m of log) {
+                if (m.speaker === i) push('assistant', m.text);
+                else push('user', `【${SPEAKERS[m.speaker].name}】${m.text}`);
+              }
+              return call(me.model, msgs);
+            }
+
+            try {
+              let agreed = false;
+              for (let t = 0; t < MAX_TURNS; t++) {
+                const i = t % N;
+                const text = await ask(i, MAX_TURNS - t <= N);
+                log.push({ speaker: i, text });
+                await comment(`**${SPEAKERS[i].name}**\n\n${text}`);
+
+                // 直近1周の全員が【合意】と書いたら終了
+                const round = log.slice(-N);
+                if (round.length === N && round.every((m) => m.text.includes('【合意】'))) {
+                  agreed = true;
+                  break;
+                }
+                await sleep(5000); // 無料枠の回数制限よけ
+              }
+
+              const transcript = log.map((m) => `【${SPEAKERS[m.speaker].name}】${m.text}`).join('\n\n');
+              const summary = await call(SUMMARY_MODEL, [
+                { role: 'system', content: 'あなたは議事録係です。日本語で簡潔に書いてください。' },
+                {
+                  role: 'user',
+                  content: `お題：${topic}\n\n${transcript}\n\n` +
+                    '上の話し合いについて、①結論 ②主な論点 ③残った課題 を箇条書きでまとめてください。',
+                },
+              ]);
+              const status = agreed ? '✅ 全員が合意しました' : `⏱ 上限の${MAX_TURNS}回に達したので打ち切りました`;
+              await comment(`**📝 まとめ**（${status}・発言${log.length}回）\n\n${summary}`);
+            } catch (e) {
+              await comment(`⚠️ 途中で止まりました\n\n${e.message}`);
+              core.setFailed(e.message);
+            }
